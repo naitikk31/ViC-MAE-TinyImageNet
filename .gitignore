@@ -9,6 +9,8 @@
 # Reports & local papers (not for public repo)
 PROJECT_REPORT.md
 project_report.md
+PROJECT_REPORT.tex
+*.tex
 *.pdf
 
 # Dataset (download separately via setup_tiny_imagenet.py)
