@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <title>ViC-MAE · Image classification</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='demo.css') }}">
+    <script defer src="{{ url_for('static', filename='demo.js') }}"></script>
+</head>
+<body>
+    <div class="ambient" aria-hidden="true"></div>
+    <header class="site-header shell">
+        <a class="brand" href="{{ url_for('index') }}">
+            <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span>ViC-MAE</span>
+        </a>
+        <nav class="header-actions" aria-label="Demo controls">
+            <a class="control" id="open-classes" href="#class-list"><span class="grid-icon" aria-hidden="true"></span>Classes</a>
+            <button class="control theme-toggle" id="theme-toggle" type="button" aria-pressed="false" hidden>
+                <span class="theme-icon" aria-hidden="true"></span><span>Light<span class="mode-word"> mode</span></span>
+            </button>
+            <span class="sr-only" id="theme-announcement" role="status"></span>
+        </nav>
+    </header>
+
+    <main class="shell">
+        <section class="hero" aria-labelledby="title">
+            <div>
+                <p class="kicker">Tiny-ImageNet-200</p>
+                <h1 id="title">Image classification</h1>
+                <p class="intro">See how ViC-MAE ranks an image across {{ num_classes }} Tiny-ImageNet classes.</p>
+            </div>
+            <aside class="checkpoint" aria-label="Loaded checkpoint and validation accuracy">
+                <div class="checkpoint-info">
+                    <span class="eyebrow">Loaded checkpoint</span>
+                    <strong>{{ checkpoint_name }}</strong>
+                </div>
+                {% if accuracy %}
+                <dl class="accuracy">
+                    <div><dt>Top-1</dt><dd>{{ accuracy.top1 }}<span>%</span></dd></div>
+                    <div><dt>Top-5</dt><dd>{{ accuracy.top5 }}<span>%</span></dd></div>
+                </dl>
+                <p class="accuracy-note">{{ accuracy.images }} validation images</p>
+                {% else %}
+                <p class="accuracy-note unmeasured">Accuracy not measured for this checkpoint.</p>
+                {% endif %}
+            </aside>
+        </section>
+
+        <div class="workbench">
+            <section class="panel upload-panel" aria-labelledby="upload-title">
+                <div class="panel-heading">
+                    <h2 id="upload-title">Image</h2>
+                    <button class="text-button" id="reset" type="button" hidden>Classify another image</button>
+                </div>
+                <form id="upload-form" method="post" enctype="multipart/form-data"
+                      action="{{ url_for('index') }}" data-max-bytes="{{ upload_limit }}">
+                    <div id="drop-zone" class="drop-zone{% if image_data %} has-preview{% endif %}">
+                        <input type="file" class="sr-only file-input" id="image" name="image" accept="image/*" aria-describedby="upload-hint">
+                        <div class="drop-content">
+                            <span class="upload-symbol" aria-hidden="true"><i></i></span>
+                            <p>Drop an image here</p>
+                            <label for="image" class="browse">Browse images</label>
+                            <small id="upload-hint">JPG, PNG or WebP · up to 8 MiB</small>
+                        </div>
+                        <div class="preview-wrap" id="preview-wrap"{% if not image_data %} hidden{% endif %}>
+                            <img id="preview" {% if image_data %}src="data:image/jpeg;base64,{{ image_data }}" {% endif %}alt="Image selected for classification">
+                            <div class="scan-line" aria-hidden="true"></div>
+                        </div>
+                    </div>
+                    <noscript><button type="submit" class="browse fallback-submit">Classify image</button></noscript>
+                </form>
+                <div id="upload-error" class="notice error" role="alert"{% if not error %} hidden{% endif %}>
+                    <span aria-hidden="true" class="notice-mark">!</span>
+                    <div><strong>Couldn’t classify the image</strong><p id="error-text">{{ error or "" }}</p></div>
+                </div>
+                {% if examples %}
+                <div class="examples">
+                    <h3>Try a validation image</h3>
+                    <div class="example-grid">
+                        {% for wnid, label in examples %}
+                        <button class="example" type="button" data-example="{{ url_for('example_image', wnid=wnid) }}"
+                                aria-label="Classify validation image of {{ label }}">
+                            <img src="{{ url_for('example_image', wnid=wnid) }}" alt="" width="64" height="64">
+                            <span>{{ label }}</span>
+                        </button>
+                        {% endfor %}
+                    </div>
+                </div>
+                {% endif %}
+            </section>
+
+            <section class="panel results-panel" aria-labelledby="results-title">
+                <div class="panel-heading">
+                    <h2 id="results-title">Top-5 predictions</h2>
+                    <span id="status" class="status" role="status"></span>
+                </div>
+                <div id="results-region" class="results-region">
+                    <div id="empty-results" class="empty-results"{% if results %} hidden{% endif %}>
+                        <div class="empty-icon" aria-hidden="true"><i></i><i></i><i></i></div>
+                        <p>Predictions appear here</p>
+                        <small>Choose an image to get the model’s ranked results.</small>
+                    </div>
+                    <div id="loading-results" class="loading-results" aria-hidden="true" hidden>
+                        {% for _ in range(5) %}<div class="skeleton-row"><i></i><i></i></div>{% endfor %}
+                    </div>
+                    <ol id="prediction-list" class="predictions"{% if not results %} hidden{% endif %}>
+                        {% for item in results %}
+                        <li class="prediction{% if loop.first %} top-prediction{% endif %}" data-confidence="{{ item.confidence }}" data-wnid="{{ item.wnid }}">
+                            <span class="rank" aria-hidden="true">{{ loop.index }}</span>
+                            <div class="prediction-detail">
+                                <div class="prediction-line">
+                                    <div class="prediction-name">{{ item.label }}</div>
+                                    <span class="score">{{ "%.1f"|format(item.pct) }}%</span>
+                                </div>
+                                <div class="prediction-meta"><span>{{ item.confidence }} confidence</span></div>
+                                <div class="score-track" aria-hidden="true"><span class="score-fill" style="--score: {{ item.pct }}%"></span></div>
+                            </div>
+                        </li>
+                        {% endfor %}
+                    </ol>
+                    <div id="low-warning" class="notice warning" role="alert"{% if not low_confidence %} hidden{% endif %}>
+                        <span aria-hidden="true" class="notice-mark">!</span>
+                        <div><strong>Low confidence</strong><p>This image may fall outside the {{ num_classes }} classes.</p></div>
+                    </div>
+                </div>
+                <p class="results-note">Softmax scores are uncalibrated. The {{ threshold }}% warning threshold is only a rough guide.</p>
+            </section>
+        </div>
+
+        <details id="class-list" class="class-panel">
+            <summary><span><strong>Class list</strong><span class="class-summary">{{ num_classes }} Tiny-ImageNet categories</span></span><span class="chevron" aria-hidden="true"></span></summary>
+            <div class="class-content">
+                <div class="class-search">
+                    <label for="class-search">Search classes</label>
+                    <input id="class-search" type="search" placeholder="Name or WordNet ID" autocomplete="off">
+                    <span id="class-count" role="status">{{ num_classes }} classes</span>
+                </div>
+                <ul id="class-grid" class="class-grid">
+                    {% for wnid, label in classes %}<li data-wnid="{{ wnid }}"><strong>{{ label }}</strong><small>{{ wnid }}</small></li>{% endfor %}
+                </ul>
+                <p id="no-classes" hidden>No matching classes.</p>
+            </div>
+        </details>
+        <footer>Images are processed locally and are never saved by the demo.</footer>
+    </main>
+
+    <template id="prediction-template">
+        <li class="prediction">
+            <span class="rank" aria-hidden="true"></span>
+            <div class="prediction-detail">
+                <div class="prediction-line">
+                    <div class="prediction-name"></div>
+                    <span class="score"><span class="score-count" aria-hidden="true"></span><span class="sr-only score-value"></span></span>
+                </div>
+                <div class="prediction-meta"><span></span></div>
+                <div class="score-track" aria-hidden="true"><span class="score-fill"></span></div>
+            </div>
+        </li>
+    </template>
+</body>
+</html>

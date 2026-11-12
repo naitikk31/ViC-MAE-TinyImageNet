@@ -32,6 +32,8 @@ build/
 
 # Virtual environments
 vicmae_venv/
+.venv-vicmae/
+.venv-vicmae-cached/
 env/
 venv/
 ENV/

@@ -16,7 +16,7 @@ This repository adapts a pretrained Vision Transformer (`ViT-Base/16`, 85.95M pa
 
 - **80.77% Top-1 Accuracy** and **94.39% Top-5 Accuracy** on Tiny-ImageNet validation split.
 - **Fast transfer learning convergence:** Climbed from 12.39% to >60% accuracy within the first 3 epochs.
-- **Interactive Darkroom Web UI (`demo.py`):** Standalone web application with a photo-lab visual theme to upload any image, visualize top-5 class predictions, and inspect exposure-style confidence readouts in real-time.
+- **Interactive Web Demo (`demo.py`):** Offline image uploads, top-five predictions, and a searchable Tiny-ImageNet class list.
 - **Dual execution paths:** Preconfigured for both high-memory cloud training (Kaggle dual-T4) and constrained local GPUs (RTX 3050 4GB with gradient accumulation).
 
 ### Performance Summary
@@ -47,19 +47,26 @@ The model was finetuned with AdamW, layer-wise learning rate decay (0.75), Mixup
 
 ## 🔬 Interactive Web Demo (`demo.py`)
 
-A local web application built with Flask and PyTorch to test the finetuned model on any custom image.
+A local Flask app that ranks the 200 Tiny-ImageNet classes for an uploaded image. It selects a local finetuning checkpoint by default, identifies the loaded file, and uses the validation preprocessing. If a matching evaluation record exists, the header shows its measured accuracy.
 
-- **Darkroom / Photo-Lab Aesthetic:** Safelight red (`#C1443B`) accents, warm charcoal canvas (`#17140F`), negative crop-marks, and monospace meter readings.
-- **Instant Inference:** Runs image through BICUBIC upsampling + center crop, evaluates on CUDA/CPU, and ranks predictions with animated exposure bars.
-- **Interactive Controls:** Drag & drop replacement, quick file selection, and reset toggles.
+The demo's softmax scores are uncalibrated, and its 30% low-confidence threshold is only a rough guide.
+
+- **Theme transition:** A wavy edge and silk strands travel down when switching to dark mode and up when switching to light mode. Reduced-motion mode switches instantly.
+- **Image upload:** Drag and drop, browse, or try a local validation example. The demo limits uploads to 8 MiB and 20 megapixels.
+- **Top-five results:** The demo uses CUDA when available and shows ranked classes with their model scores.
 
 ### Running the Demo
 
+With the project Python environment active, run:
+
 ```bash
-# Ensure model checkpoint is located in output directory
 python demo.py
 ```
 Then open [http://127.0.0.1:5000](http://127.0.0.1:5000) in your browser.
+
+From the project directory on Windows, the local interpreter is `.\.venv-vicmae-cached\env\Scripts\python.exe`.
+
+Use `python demo.py --checkpoint PATH` to select a checkpoint. Run `python eval_tiny_imagenet.py` to evaluate the default checkpoint on the validation split. The evaluator saves a new `validation.json` with the actual image count and metrics under `output/classification_eval/`.
 
 ---
 
@@ -138,7 +145,7 @@ python image_finetune.py \
 
 ```
 .
-├── demo.py                             # Interactive Flask darkroom demo web app
+├── demo.py                             # Interactive Flask classifier demo
 ├── vicmae_finetune_tinyimagenet.ipynb  # End-to-end self-contained Kaggle notebook
 ├── plot_results.py                     # Metric extraction & curve plotting script
 ├── setup_tiny_imagenet.py              # Automated download & ImageFolder reorganizer

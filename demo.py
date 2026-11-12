@@ -1,486 +1,266 @@
-"""
-ViC-MAE Demo — Upload an image and classify it with the finetuned ViT-B/16.
+"""Run the local ViC-MAE Tiny-ImageNet classifier at http://127.0.0.1:5000."""
 
-Usage:
-    python demo.py
-
-Opens a web UI at http://127.0.0.1:5000
-"""
-import os, sys, io, base64, json
-import torch
-import torch.nn.functional as F
+import argparse
+import base64
+import io
+import pickle
+import sys
 from pathlib import Path
-from PIL import Image
-from torchvision import transforms
-from flask import Flask, request, render_template_string
+from threading import Lock, Timer
 
-# ── Paths ──────────────────────────────────────────────────────────────
-PROJECT_DIR = Path(__file__).resolve().parent
-REPO_DIR = PROJECT_DIR / "ViC-MAE"
-CKPT_PATH = PROJECT_DIR / "output" / "20260918-044542-vit_base_patch16-224" / "checkpoint-20.pth"
-WORDS_FILE = PROJECT_DIR / "tiny-imagenet-200" / "words.txt"
-DATA_DIR = PROJECT_DIR / "tiny-imagenet-200"
+import torch
+from flask import Flask, Request, jsonify, render_template, request, send_file
+from PIL import Image, JpegImagePlugin
+from torchvision.datasets.folder import find_classes
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
-sys.path.insert(0, str(REPO_DIR))
+from classifier_checkpoints import (
+    DATA_DIR,
+    INPUT_SIZE,
+    NUM_CLASSES,
+    PROJECT_DIR,
+    UPSTREAM_DIR,
+    checkpoint_globals,
+    measured_accuracy,
+    newest_classifier_checkpoint,
+)
+
+sys.path.insert(0, str(UPSTREAM_DIR))
 import models_vit
+from util.datasets import build_transform
 
-# ── Build class label mapping ──────────────────────────────────────────
-def build_class_labels():
-    train_dir = DATA_DIR / "train"
-    class_ids = sorted([d.name for d in train_dir.iterdir() if d.is_dir()])
+LOW_CONFIDENCE_THRESHOLD = 0.30
+HIGH_CONFIDENCE_THRESHOLD = 0.70
+BYTES_PER_MIB = 1024 * 1024
+MAX_UPLOAD_BYTES = 8 * BYTES_PER_MIB
+MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 64 * 1024
+MAX_IMAGE_PIXELS = 20_000_000
+UI_DIR = PROJECT_DIR / "demo_ui"
+VALIDATION_EXAMPLES = {
+    "n01443537": "val_1230.JPEG",
+    "n02099601": "val_1321.JPEG",
+    "n04146614": "val_1097.JPEG",
+}
+
+
+def build_class_labels(data_path: Path):
+    class_ids, _ = find_classes(data_path / "train")
+    expected_ids = (data_path / "wnids.txt").read_text(encoding="utf-8").split()
+    if len(class_ids) != NUM_CLASSES or class_ids != sorted(expected_ids):
+        raise ValueError(f"{data_path / 'train'} must contain the {NUM_CLASSES} Tiny-ImageNet class folders.")
+
+    words_file = data_path / "words.txt"
     wnid_to_name = {}
-    with open(WORDS_FILE) as f:
-        for line in f:
-            parts = line.strip().split('\t', 1)
-            if len(parts) == 2:
-                wnid_to_name[parts[0]] = parts[1].split(',')[0].strip()
-    return {idx: wnid_to_name.get(wnid, wnid) for idx, wnid in enumerate(class_ids)}
+    with words_file.open(encoding="utf-8") as words:
+        for line in words:
+            wnid, separator, names = line.rstrip("\r\n").partition("\t")
+            if separator and names.strip():
+                wnid_to_name[wnid] = names.split(",", 1)[0].strip()
+    missing = [wnid for wnid in class_ids if not wnid_to_name.get(wnid)]
+    if missing:
+        raise ValueError(f"{words_file} has no readable names for: {', '.join(missing)}")
+    return [(wnid, wnid_to_name[wnid]) for wnid in class_ids]
 
-# ── Load model ─────────────────────────────────────────────────────────
-def load_model():
-    print("Loading ViT-B/16 model...")
-    model = models_vit.vit_base_patch16(num_classes=200, global_pool=False)
-    checkpoint = torch.load(str(CKPT_PATH), map_location='cpu', weights_only=False)
-    state_dict = checkpoint.get('model', checkpoint)
-    model.load_state_dict(state_dict, strict=True)
-    model.eval()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    print(f"Model loaded on {device}")
+
+def load_model(checkpoint_path: Path):
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Classifier checkpoint not found: {checkpoint_path}")
+    try:
+        with checkpoint_globals(checkpoint_path, allow_saved_args=True):
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except (pickle.UnpicklingError, EOFError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Could not load classifier checkpoint {checkpoint_path}: {exc}") from exc
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{checkpoint_path} must contain a classifier state dictionary.")
+    state_dict = checkpoint.get("model", checkpoint)
+    if not isinstance(state_dict, dict) or "head.weight" not in state_dict:
+        raise ValueError(f"{checkpoint_path} is missing the trained Tiny-ImageNet classifier head.")
+    model = models_vit.vit_base_patch16(num_classes=NUM_CLASSES, global_pool=False)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise ValueError(f"{checkpoint_path} is incompatible with the Tiny-ImageNet ViT-B/16: {exc}") from exc
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device).eval()
+    print(f"Loaded classifier from {checkpoint_path} on {device}")
     return model, device
 
-# ── Image preprocessing ────────────────────────────────────────────────
-preprocess = transforms.Compose([
-    transforms.Resize(256, interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
 
-# ── HTML Template ──────────────────────────────────────────────────────
-HTML = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ViC-MAE · Darkroom</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
-    <style>
-        /* ── Reset ─────────────────────────────────────── */
-        *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+class MemoryUploadRequest(Request):
+    """Keep multipart files in memory instead of Werkzeug's temporary-file spool."""
 
-        /* ── Tokens ────────────────────────────────────── */
-        :root {
-            --bg:        #17140F;
-            --surface:   #211D18;
-            --accent:    #C1443B;
-            --accent-hover: #A33830;
-            --amber:     #E8A33D;
-            --border:    #3A332B;
-            --text:      #EDE6DA;
-            --muted:     #A89F94;
-            --sans:      'Space Grotesk', system-ui, sans-serif;
-            --mono:      'JetBrains Mono', 'Consolas', monospace;
-        }
+    def _get_file_stream(self, total_content_length, content_type, filename=None, content_length=None):
+        return io.BytesIO()
 
-        /* ── Page ──────────────────────────────────────── */
-        body {
-            font-family: var(--sans);
-            background: var(--bg);
-            color: var(--text);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            padding: 60px 20px;
-        }
-        .container { max-width: 640px; width: 100%; }
 
-        /* ── Header ────────────────────────────────────── */
-        .header { text-align: center; margin-bottom: 36px; }
-        h1 {
-            font-size: 1.75em;
-            font-weight: 700;
-            letter-spacing: -0.02em;
-            color: var(--text);
-            margin-bottom: 6px;
-        }
-        h1 .icon { font-size: 0.85em; margin-right: 4px; }
-        .subtitle {
-            color: var(--muted);
-            font-size: 0.85em;
-            margin-bottom: 16px;
-        }
+def confidence_level(probability):
+    if probability < LOW_CONFIDENCE_THRESHOLD:
+        return "low"
+    if probability >= HIGH_CONFIDENCE_THRESHOLD:
+        return "high"
+    return "medium"
 
-        /* ── Stat badges (camera-readout style) ────────── */
-        .badges { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }
-        .badge {
-            font-family: var(--mono);
-            font-size: 0.75em;
-            font-weight: 600;
-            color: var(--muted);
-            border: 1px solid var(--border);
-            padding: 4px 12px;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
-        }
-        .badge .val { color: var(--text); }
 
-        /* ── Dropzone with crop marks ──────────────────── */
-        .dropzone-wrapper { position: relative; margin: 32px 0 24px; }
-        .dropzone {
-            background: var(--surface);
-            min-height: 220px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: background 0.2s;
-            position: relative;
-        }
-        .dropzone:hover { background: #2A251E; }
-        .dropzone.has-image { min-height: unset; }
-        .dropzone img {
-            max-width: 100%;
-            max-height: 340px;
-            display: block;
-        }
-        .dropzone-placeholder {
-            text-align: center;
-            color: var(--muted);
-            font-size: 0.9em;
-            line-height: 1.6;
-        }
-        .dropzone-placeholder .arrow { font-size: 1.8em; margin-bottom: 8px; display: block; color: var(--border); }
+def describe_bytes(size):
+    return f"{size / BYTES_PER_MIB:.2f} MiB ({size:,} bytes)"
 
-        /* ── Crop / register marks ─────────────────────── */
-        .crop-mark {
-            position: absolute;
-            width: 20px;
-            height: 20px;
-            pointer-events: none;
-        }
-        .crop-mark::before, .crop-mark::after {
-            content: '';
-            position: absolute;
-            background: var(--border);
-        }
-        /* horizontal stroke */
-        .crop-mark::before { width: 20px; height: 1px; }
-        /* vertical stroke */
-        .crop-mark::after  { width: 1px; height: 20px; }
 
-        .crop-mark.tl { top: -6px; left: -6px; }
-        .crop-mark.tl::before { top: 0; left: 0; }
-        .crop-mark.tl::after  { top: 0; left: 0; }
+def pixel_limit_message(file_bytes, width, height):
+    pixels = width * height
+    return (
+        f"Your image is {pixels / 1_000_000:.2f} MP "
+        f"({width:,} × {height:,}, {pixels:,} pixels) and {describe_bytes(file_bytes)}. "
+        f"The pixel limit is {MAX_IMAGE_PIXELS / 1_000_000:g} MP. "
+        f"The file limit is {describe_bytes(MAX_UPLOAD_BYTES)}."
+    )
 
-        .crop-mark.tr { top: -6px; right: -6px; }
-        .crop-mark.tr::before { top: 0; right: 0; }
-        .crop-mark.tr::after  { top: 0; right: 0; }
 
-        .crop-mark.bl { bottom: -6px; left: -6px; }
-        .crop-mark.bl::before { bottom: 0; left: 0; }
-        .crop-mark.bl::after  { bottom: 0; left: 0; }
+def read_image():
+    uploaded = request.files.get("image")
+    if not uploaded or not uploaded.filename:
+        raise BadRequest("Choose an image to classify.")
+    file_bytes = uploaded.stream.seek(0, io.SEEK_END)
+    if file_bytes > MAX_UPLOAD_BYTES:
+        raise RequestEntityTooLarge(
+            f"Your image file is {describe_bytes(file_bytes)}. "
+            f"The file limit is {describe_bytes(MAX_UPLOAD_BYTES)}."
+        )
+    uploaded.stream.seek(0)
+    try:
+        with Image.open(uploaded.stream) as source:
+            width, height = source.size
+            if width * height > MAX_IMAGE_PIXELS:
+                raise RequestEntityTooLarge(pixel_limit_message(file_bytes, width, height))
+            return source.convert("RGB")
+    except Image.DecompressionBombError as exc:
+        # Pillow can reject the JPEG header before Image.open returns its dimensions.
+        # Read only the header for the error message. This image is always rejected.
+        uploaded.stream.seek(0)
+        try:
+            with JpegImagePlugin.JpegImageFile(uploaded.stream) as header:
+                message = pixel_limit_message(file_bytes, *header.size)
+        except (OSError, ValueError, SyntaxError):
+            message = (
+                f"Your image file is {describe_bytes(file_bytes)}. "
+                f"Choose an image up to {MAX_IMAGE_PIXELS / 1_000_000:g} MP."
+            )
+        raise RequestEntityTooLarge(f"{message} The image decoder's safety limit was exceeded.") from exc
+    except (OSError, ValueError, SyntaxError) as exc:
+        raise BadRequest("Could not read that image. Try a JPG, PNG, or WebP file.") from exc
 
-        .crop-mark.br { bottom: -6px; right: -6px; }
-        .crop-mark.br::before { bottom: 0; right: 0; }
-        .crop-mark.br::after  { bottom: 0; right: 0; }
 
-        input[type="file"] { display: none; }
-
-        /* ── Action buttons ────────────────────────────── */
-        .actions {
-            display: flex;
-            gap: 12px;
-            width: 100%;
-        }
-        .btn {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            width: 100%;
-            padding: 14px 20px;
-            background: var(--accent);
-            color: var(--text);
-            border: none;
-            font-family: var(--sans);
-            font-size: 0.95em;
-            font-weight: 600;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
-            cursor: pointer;
-            text-decoration: none;
-            transition: background 0.15s, border-color 0.15s, color 0.15s;
-        }
-        .btn:hover { background: var(--accent-hover); }
-        .btn-clear {
-            width: auto;
-            min-width: 110px;
-            background: transparent;
-            border: 1px solid var(--border);
-            color: var(--muted);
-            font-family: var(--mono);
-            font-size: 0.85em;
-        }
-        .btn-clear:hover {
-            background: var(--surface);
-            border-color: var(--muted);
-            color: var(--text);
-        }
-
-        /* ── Dropzone hover overlay ─────────────────────── */
-        .dropzone-overlay {
-            position: absolute;
-            inset: 0;
-            background: rgba(23, 20, 15, 0.78);
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            opacity: 0;
-            transition: opacity 0.2s;
-            color: var(--text);
-            font-family: var(--mono);
-            font-size: 0.8em;
-            letter-spacing: 0.06em;
-            text-transform: uppercase;
-        }
-        .dropzone:hover .dropzone-overlay { opacity: 1; }
-
-        /* ── Results ───────────────────────────────────── */
-        .results {
-            margin-top: 32px;
-            border-top: 1px solid var(--border);
-            padding-top: 24px;
-        }
-        .results-title {
-            font-size: 0.7em;
-            font-family: var(--mono);
-            text-transform: uppercase;
-            letter-spacing: 0.12em;
-            color: var(--muted);
-            margin-bottom: 16px;
-        }
-
-        .result-row {
-            display: flex;
-            align-items: center;
-            padding: 10px 0;
-            border-left: 3px solid transparent;
-            padding-left: 12px;
-            margin-bottom: 4px;
-        }
-        .result-row.top-1 {
-            border-left-color: var(--accent);
-            background: rgba(193, 68, 59, 0.06);
-        }
-
-        .rank {
-            font-family: var(--mono);
-            font-weight: 600;
-            font-size: 0.8em;
-            color: var(--muted);
-            width: 24px;
-            flex-shrink: 0;
-        }
-        .result-row.top-1 .rank { color: var(--accent); }
-
-        .result-label {
-            font-size: 0.9em;
-            font-weight: 600;
-            color: var(--text);
-            width: 160px;
-            flex-shrink: 0;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-
-        .bar-track {
-            flex: 1;
-            height: 22px;
-            background: var(--surface);
-            margin: 0 14px;
-            overflow: hidden;
-            position: relative;
-        }
-        .bar-fill {
-            height: 100%;
-            background: linear-gradient(90deg, var(--accent), var(--amber));
-            transition: width 0.6s ease-out;
-        }
-        .result-row:not(.top-1) .bar-fill {
-            background: linear-gradient(90deg, #3A332B, #4A4238);
-        }
-
-        .result-pct {
-            font-family: var(--mono);
-            font-weight: 600;
-            font-size: 0.85em;
-            color: var(--muted);
-            width: 55px;
-            text-align: right;
-            flex-shrink: 0;
-        }
-        .result-row.top-1 .result-pct { color: var(--text); }
-
-        /* ── Footer ────────────────────────────────────── */
-        .footer {
-            margin-top: 40px;
-            text-align: center;
-            font-size: 0.7em;
-            font-family: var(--mono);
-            color: var(--border);
-            letter-spacing: 0.06em;
-        }
-    </style>
-</head>
-<body>
-<div class="container">
-
-    <!-- Header -->
-    <div class="header">
-        <h1><span class="icon">◉</span> ViC-MAE Classifier</h1>
-        <p class="subtitle">ViT-Base/16 · finetuned on Tiny-ImageNet-200</p>
-        <div class="badges">
-            <div class="badge"><span class="val">80.77%</span> TOP-1</div>
-            <div class="badge"><span class="val">94.39%</span> TOP-5</div>
-            <div class="badge"><span class="val">200</span> CLASSES</div>
-        </div>
-    </div>
-
-    <!-- Upload form -->
-    <form method="POST" enctype="multipart/form-data">
-        <div class="dropzone-wrapper">
-            <div class="crop-mark tl"></div>
-            <div class="crop-mark tr"></div>
-            <div class="crop-mark bl"></div>
-            <div class="crop-mark br"></div>
-            <div class="dropzone {{ 'has-image' if image_data else '' }}"
-                 id="dropzone"
-                 onclick="document.getElementById('file').click()">
-                {% if image_data %}
-                    <img src="data:image/jpeg;base64,{{ image_data }}" alt="Uploaded image">
-                    <div class="dropzone-overlay">
-                        <span style="font-size:1.8em; margin-bottom:6px;">⟲</span>
-                        Click to change image
-                    </div>
-                {% else %}
-                    <div class="dropzone-placeholder">
-                        <span class="arrow">⤓</span>
-                        Drop image here or <b>click to browse</b><br>
-                        <span style="font-size:0.8em; color: var(--border);">JPG · PNG · WEBP</span>
-                    </div>
-                {% endif %}
-            </div>
-        </div>
-        <input type="file" name="image" id="file" accept="image/*"
-               onchange="previewAndSubmit(this)">
-        {% if results %}
-        <div class="actions">
-            <button type="button" class="btn" onclick="document.getElementById('file').click()">⤓ TEST ANOTHER IMAGE</button>
-            <a href="/" class="btn btn-clear">↺ RESET</a>
-        </div>
-        {% else %}
-        <button type="submit" class="btn">▸ CLASSIFY</button>
-        {% endif %}
-    </form>
-
-    <!-- Results -->
-    {% if results %}
-    <div class="results">
-        <div class="results-title">Top-5 predictions</div>
-        {% for item in results %}
-        <div class="result-row {{ 'top-1' if loop.index == 1 else '' }}">
-            <div class="rank">{{ loop.index }}</div>
-            <div class="result-label" title="{{ item.label }}">{{ item.label }}</div>
-            <div class="bar-track">
-                <div class="bar-fill" style="width: {{ item.pct }}%"></div>
-            </div>
-            <div class="result-pct">{{ item.pct }}%</div>
-        </div>
-        {% endfor %}
-    </div>
-    {% endif %}
-
-    <div class="footer">ECCV 2024 · HERNANDEZ, VILLEGAS, ORDONEZ</div>
-</div>
-
-<script>
-    const dz = document.getElementById('dropzone');
-    ['dragenter','dragover'].forEach(e =>
-        dz.addEventListener(e, ev => { ev.preventDefault(); dz.style.background = '#2A251E'; }));
-    ['dragleave','drop'].forEach(e =>
-        dz.addEventListener(e, ev => { ev.preventDefault(); dz.style.background = ''; }));
-    dz.addEventListener('drop', ev => {
-        if (ev.dataTransfer.files[0]) {
-            document.getElementById('file').files = ev.dataTransfer.files;
-            previewAndSubmit(document.getElementById('file'));
-        }
-    });
-    function previewAndSubmit(input) {
-        if (input.files && input.files[0]) {
-            const r = new FileReader();
-            r.onload = e => {
-                dz.classList.add('has-image');
-                dz.innerHTML = '<img src="'+e.target.result+'" alt="Preview">';
-                input.form.submit();
-            };
-            r.readAsDataURL(input.files[0]);
-        }
+def create_app(checkpoint_path=None, data_path=DATA_DIR):
+    checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path is not None else newest_classifier_checkpoint()
+    data_path = Path(data_path).resolve()
+    model, device = load_model(checkpoint_path)
+    class_labels = build_class_labels(data_path)
+    preprocess = build_transform(is_train=False, args=argparse.Namespace(input_size=INPUT_SIZE))
+    accuracy = measured_accuracy(checkpoint_path)
+    labels = dict(class_labels)
+    examples = {
+        wnid: path for wnid, filename in VALIDATION_EXAMPLES.items()
+        if (path := data_path / "val" / wnid / filename).is_file() and wnid in labels
     }
-</script>
-</body>
-</html>
-"""
 
-# ── Flask App ──────────────────────────────────────────────────────────
-app = Flask(__name__)
+    app = Flask(__name__, template_folder=str(UI_DIR / "templates"), static_folder=str(UI_DIR / "static"))
+    app.request_class = MemoryUploadRequest
+    app.config.update(MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES, MAX_FORM_PARTS=4)
+    inference_lock = Lock()
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    results = None
-    image_data = None
+    def respond(results=(), image_data=None, error=None, status=200):
+        low_confidence = bool(results and results[0]["confidence"] == "low")
+        if request.accept_mimetypes.best_match(("text/html", "application/json")) == "application/json":
+            response = jsonify(results=results, low_confidence=low_confidence, error=error)
+        else:
+            response = app.make_response(render_template(
+                "index.html", checkpoint_name=checkpoint_path.name, accuracy=accuracy,
+                results=results, image_data=image_data, error=error, low_confidence=low_confidence,
+                classes=sorted(class_labels, key=lambda item: item[1].casefold()),
+                examples=[(wnid, labels[wnid]) for wnid in examples],
+                upload_limit=MAX_UPLOAD_BYTES,
+                threshold=round(LOW_CONFIDENCE_THRESHOLD * 100), num_classes=NUM_CLASSES,
+            ))
+        response.status_code = status
+        response.cache_control.no_store = True
+        return response
 
-    if request.method == "POST" and "image" in request.files:
-        file = request.files["image"]
-        if file.filename:
-            img_bytes = file.read()
-            image_data = base64.b64encode(img_bytes).decode("utf-8")
+    @app.errorhandler(BadRequest)
+    def invalid_upload(error):
+        return respond(error=error.description, status=400)
 
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    @app.errorhandler(RequestEntityTooLarge)
+    def large_upload(error):
+        if error.description != RequestEntityTooLarge.description:
+            message = error.description
+        elif request.content_length is not None and request.content_length > MAX_REQUEST_BYTES:
+            message = (
+                f"The upload request is {describe_bytes(request.content_length)} including form overhead. "
+                f"The request limit is {describe_bytes(MAX_REQUEST_BYTES)}. "
+                f"The image file limit is {describe_bytes(MAX_UPLOAD_BYTES)}."
+            )
+        else:
+            message = (
+                "The upload exceeded a server form limit. "
+                f"Choose a single image file up to {describe_bytes(MAX_UPLOAD_BYTES)} and try again."
+            )
+        return respond(error=message, status=413)
+
+    @app.get("/examples/<wnid>")
+    def example_image(wnid):
+        if wnid not in examples:
+            return "", 404
+        return send_file(examples[wnid], mimetype="image/jpeg")
+
+    @app.route("/", methods=["GET", "POST"])
+    def index():
+        if request.method == "GET":
+            return respond()
+
+        img = read_image()
+        with inference_lock, torch.inference_mode():
             img_tensor = preprocess(img).unsqueeze(0).to(device)
-
-            with torch.no_grad():
-                logits = model(img_tensor)
-                probs = F.softmax(logits, dim=-1)[0]
-
+            probs = model(img_tensor).softmax(dim=-1)[0]
             top5_probs, top5_indices = probs.topk(5)
-            results = []
-            for prob, idx in zip(top5_probs, top5_indices):
-                label = class_labels.get(idx.item(), f"Class {idx.item()}")
-                pct = round(float(prob) * 100, 1)
-                results.append({"label": label, "pct": pct})
+            probabilities = top5_probs.tolist()
+            indices = top5_indices.tolist()
 
-    return render_template_string(HTML, results=results, image_data=image_data)
+        results = []
+        for prob, idx in zip(probabilities, indices):
+            wnid, label = class_labels[idx]
+            results.append({"wnid": wnid, "label": label, "pct": round(prob * 100, 1),
+                            "confidence": confidence_level(prob)})
+
+        image_data = None
+        if request.accept_mimetypes.best_match(("text/html", "application/json")) != "application/json":
+            # Resize only the fallback preview. Inference uses the original RGB image.
+            img.thumbnail((960, 960), Image.Resampling.LANCZOS)
+            preview = io.BytesIO()
+            img.save(preview, format="JPEG")
+            image_data = base64.b64encode(preview.getvalue()).decode("ascii")
+        return respond(results=results, image_data=image_data)
+
+    return app
 
 
 if __name__ == "__main__":
-    if not CKPT_PATH.exists():
-        print(f"ERROR: Checkpoint not found at {CKPT_PATH}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Run the Tiny-ImageNet classifier demo.")
+    parser.add_argument("--checkpoint", type=Path, help="Local classifier file. Defaults to the newest available finetuning checkpoint.")
+    parser.add_argument("--data-path", type=Path, default=DATA_DIR)
+    parser.add_argument("--port", type=int, default=5000, help="Local port for the demo (default: 5000).")
+    args = parser.parse_args()
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535.")
+    try:
+        app = create_app(args.checkpoint, args.data_path)
+    except (OSError, ValueError, RuntimeError) as exc:
+        parser.exit(1, f"Unable to start classifier: {exc}\n")
 
-    class_labels = build_class_labels()
-    model, device = load_model()
-
-    print("\n" + "="*50)
-    print("  ViC-MAE Demo is running!")
-    print("  Open: http://127.0.0.1:5000")
-    print("="*50 + "\n")
-
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"Open {url} to classify an image.")
     import webbrowser
-    webbrowser.open("http://127.0.0.1:5000")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+
+    browser = Timer(0.5, webbrowser.open, args=(url,))
+    browser.daemon = True
+    browser.start()
+    app.run(host="127.0.0.1", port=args.port, debug=False)
