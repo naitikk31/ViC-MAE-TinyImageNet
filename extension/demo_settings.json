@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "checkpoint_sha256": "42b6ef953defb86078e84932e259705e1c65e7c538ed68e2c7dfffee88db6eed",
+  "score": "msp_calibrated",
+  "recipe": "original_flip_corners",
+  "temperature": 0.7367429957677568,
+  "threshold": 0.6902217852275317,
+  "outside_classes_threshold": -6.356711256789089
+}

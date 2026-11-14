@@ -13,6 +13,8 @@ from flask import Flask, Request, jsonify, render_template, request, send_file
 from PIL import Image, JpegImagePlugin
 from torchvision.datasets.folder import find_classes
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
+from extension.demo_integration import interpret, load_settings, render_attribution, resolve_settings_path
+from extension.pipeline import Pipeline
 
 from classifier_checkpoints import (
     DATA_DIR,
@@ -150,10 +152,14 @@ def read_image():
         raise BadRequest("Could not read that image. Try a JPG, PNG, or WebP file.") from exc
 
 
-def create_app(checkpoint_path=None, data_path=DATA_DIR):
+def create_app(checkpoint_path=None, data_path=DATA_DIR, reliability_settings=None, *, classifier=None):
     checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path is not None else newest_classifier_checkpoint()
     data_path = Path(data_path).resolve()
-    model, device = load_model(checkpoint_path)
+    model, device = load_model(checkpoint_path) if classifier is None else classifier
+    settings = load_settings(checkpoint_path, reliability_settings)
+    pipeline = None
+    if settings and settings.get('schema_version') == 2:
+        pipeline = Pipeline.load(model, device, checkpoint_path, resolve_settings_path(reliability_settings))
     class_labels = build_class_labels(data_path)
     preprocess = build_transform(is_train=False, args=argparse.Namespace(input_size=INPUT_SIZE))
     accuracy = measured_accuracy(checkpoint_path)
@@ -168,14 +174,19 @@ def create_app(checkpoint_path=None, data_path=DATA_DIR):
     app.config.update(MAX_CONTENT_LENGTH=MAX_REQUEST_BYTES, MAX_FORM_PARTS=4)
     inference_lock = Lock()
 
-    def respond(results=(), image_data=None, error=None, status=200):
+    def respond(results=(), image_data=None, error=None, status=200, *, unsure=False, rejection_score=None,
+                probabilities=None, outside_classes=False, outside_classes_score=None):
         low_confidence = bool(results and results[0]["confidence"] == "low")
         if request.accept_mimetypes.best_match(("text/html", "application/json")) == "application/json":
-            response = jsonify(results=results, low_confidence=low_confidence, error=error)
+            response = jsonify(results=results, low_confidence=low_confidence, error=error,
+                               calibrated=settings is not None, unsure=unsure, rejection_score=rejection_score,
+                               probabilities=probabilities, outside_classes=outside_classes,
+                               outside_classes_score=outside_classes_score)
         else:
             response = app.make_response(render_template(
                 "index.html", checkpoint_name=checkpoint_path.name, accuracy=accuracy,
                 results=results, image_data=image_data, error=error, low_confidence=low_confidence,
+                calibrated=settings is not None, unsure=unsure, outside_classes=outside_classes,
                 classes=sorted(class_labels, key=lambda item: item[1].casefold()),
                 examples=[(wnid, labels[wnid]) for wnid in examples],
                 upload_limit=MAX_UPLOAD_BYTES,
@@ -212,15 +223,41 @@ def create_app(checkpoint_path=None, data_path=DATA_DIR):
             return "", 404
         return send_file(examples[wnid], mimetype="image/jpeg")
 
+    @app.post("/heatmap")
+    def heatmap():
+        if settings is None:
+            return "", 404
+        img = read_image()
+        comparison = request.accept_mimetypes.best_match(("image/png", "application/json")) == "application/json"
+        with inference_lock:
+            transform = pipeline.preprocess.center_transform if pipeline else preprocess
+            target = int(pipeline.predict(img)[0].argmax()) if pipeline else None
+            inputs = transform(img).unsqueeze(0).to(device)
+            payload = render_attribution(model, inputs, transform.transforms[-1], target=target, comparison=comparison)
+        response = jsonify(payload) if comparison else send_file(payload, mimetype="image/png")
+        response.cache_control.no_store = True
+        return response
+
     @app.route("/", methods=["GET", "POST"])
     def index():
         if request.method == "GET":
             return respond()
 
         img = read_image()
+        rejection_score = None
+        unsure = False
+        outside_classes_score = None
+        outside_classes = False
         with inference_lock, torch.inference_mode():
-            img_tensor = preprocess(img).unsqueeze(0).to(device)
-            probs = model(img_tensor).softmax(dim=-1)[0]
+            if pipeline:
+                prediction, rejection_score, unsure, outside_classes_score, outside_classes = pipeline.predict_with_flags(img)
+                probs = torch.from_numpy(prediction)
+            else:
+                logits = model(preprocess(img).unsqueeze(0).to(device))
+                if settings is not None:
+                    probs, rejection_score, unsure = interpret(logits, settings)
+                else:
+                    probs = logits.softmax(dim=-1)[0]
             top5_probs, top5_indices = probs.topk(5)
             probabilities = top5_probs.tolist()
             indices = top5_indices.tolist()
@@ -238,7 +275,9 @@ def create_app(checkpoint_path=None, data_path=DATA_DIR):
             preview = io.BytesIO()
             img.save(preview, format="JPEG")
             image_data = base64.b64encode(preview.getvalue()).decode("ascii")
-        return respond(results=results, image_data=image_data)
+        return respond(results=results, image_data=image_data, unsure=unsure, rejection_score=rejection_score,
+                       probabilities=probs.tolist() if pipeline else None, outside_classes=outside_classes,
+                       outside_classes_score=outside_classes_score)
 
     return app
 
@@ -247,12 +286,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the Tiny-ImageNet classifier demo.")
     parser.add_argument("--checkpoint", type=Path, help="Local classifier file. Defaults to the newest available finetuning checkpoint.")
     parser.add_argument("--data-path", type=Path, default=DATA_DIR)
+    parser.add_argument("--reliability-settings", type=Path, help="Measured settings for this exact checkpoint.")
     parser.add_argument("--port", type=int, default=5000, help="Local port for the demo (default: 5000).")
     args = parser.parse_args()
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535.")
     try:
-        app = create_app(args.checkpoint, args.data_path)
+        app = create_app(args.checkpoint, args.data_path, args.reliability_settings)
     except (OSError, ValueError, RuntimeError) as exc:
         parser.exit(1, f"Unable to start classifier: {exc}\n")
 

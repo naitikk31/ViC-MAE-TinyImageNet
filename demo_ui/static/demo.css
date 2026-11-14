@@ -482,3 +482,18 @@ footer { padding: 16px 0 21px; color: var(--muted); text-align: center; font-siz
     :root[data-theme-transition="view"]::view-transition-new(root) { animation: none; }
     .theme-wave-canvas { display: none; }
 }
+.heatmap-controls:not([hidden]) {
+    display: flex;
+    align-items: baseline;
+    gap: 0.75rem;
+    margin-top: 0.75rem;
+}
+.heatmap-comparison { margin-top: 20px; }
+.heatmap-comparison h2 { margin: 0 0 14px; font-size: 19px; }
+.heatmap-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: clamp(6px, 2vw, 16px); }
+.heatmap-grid figure { margin: 0; text-align: center; }
+.heatmap-grid img { display: block; width: 100%; aspect-ratio: 1; border-radius: 8px; }
+.heatmap-grid figcaption { margin-top: 7px; font-size: clamp(11px, 2vw, 14px); }
+.heatmap-legend { display: flex; align-items: center; gap: 9px; justify-content: center; margin-top: 16px; font-size: 12px; }
+.heatmap-gradient { width: min(50%, 224px); height: 10px; border-radius: 3px;
+    background: linear-gradient(90deg, #000080, #0000ff 12.5%, #00ffff 37.5%, #ffff00 62.5%, #ff0000 87.5%, #800000); }

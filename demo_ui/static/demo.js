@@ -12,6 +12,15 @@ const loadingResults = byId("loading-results");
 const predictions = byId("prediction-list");
 const predictionTemplate = byId("prediction-template");
 const lowWarning = byId("low-warning");
+const outsideClassesWarning = byId("outside-classes-warning");
+const heatmapControls = byId("heatmap-controls");
+const heatmapToggle = byId("heatmap-toggle");
+const heatmapStatus = byId("heatmap-status");
+const heatmapComparison = byId("heatmap-comparison");
+const heatmapPanels = {original: byId("heatmap-original"), heatmap: byId("heatmap-only"), overlay: byId("heatmap-overlay")};
+let heatmapFile = null;
+let heatmapRequest = null;
+let heatmapReady = false;
 const status = byId("status");
 const resetButton = byId("reset");
 const error = byId("upload-error");
@@ -284,6 +293,7 @@ function showPreview(source, isObjectUrl) {
     clearPreview();
     if (isObjectUrl) objectUrl = source;
     preview.src = source;
+    preview.alt = "Image selected for classification";
     previewWrap.hidden = false;
     dropZone.classList.add("has-preview");
 }
@@ -301,7 +311,21 @@ function clearResults() {
     predictions.replaceChildren();
     predictions.hidden = true;
     lowWarning.hidden = true;
+    outsideClassesWarning.hidden = true;
     emptyResults.hidden = false;
+    if (heatmapControls) {
+        heatmapRequest?.abort();
+        heatmapRequest = null;
+        heatmapReady = false;
+        heatmapFile = null;
+        heatmapComparison.hidden = true;
+        for (const panel of Object.values(heatmapPanels)) panel.removeAttribute("src");
+        heatmapControls.hidden = true;
+        heatmapToggle.disabled = false;
+        heatmapToggle.textContent = "Show heatmap";
+        heatmapToggle.setAttribute("aria-pressed", "false");
+        heatmapStatus.textContent = "";
+    }
 }
 
 function clearError() {
@@ -342,7 +366,8 @@ function showResults(data) {
     predictions.replaceChildren(fragment);
     predictions.hidden = false;
     emptyResults.hidden = true;
-    lowWarning.hidden = !data.low_confidence;
+    lowWarning.hidden = !(data.calibrated ? data.unsure : data.low_confidence);
+    outsideClassesWarning.hidden = !data.outside_classes;
     status.textContent = "Complete";
 
     if (animate) {
@@ -405,12 +430,59 @@ async function classify(file, exampleUrl) {
         }
         setLoading(false);
         showResults(data);
+        if (data.calibrated && heatmapControls) {
+            heatmapFile = file;
+            heatmapControls.hidden = false;
+        }
     } catch {
         if (activeRequest === controller) showError("The local demo could not process this image. Try again.");
     } finally {
         if (activeRequest === controller) activeRequest = null;
     }
 }
+
+heatmapToggle?.addEventListener("click", async () => {
+    if (!heatmapFile || heatmapRequest) return;
+    const showing = heatmapToggle.getAttribute("aria-pressed") === "true";
+    if (showing) {
+        heatmapComparison.hidden = true;
+        heatmapToggle.textContent = "Show heatmap";
+        heatmapToggle.setAttribute("aria-pressed", "false");
+        return;
+    }
+
+    const controller = new AbortController();
+    if (!heatmapReady) {
+        heatmapRequest = controller;
+        heatmapToggle.disabled = true;
+        heatmapStatus.textContent = "Generating heatmap…";
+        try {
+            const body = new FormData();
+            body.set("image", heatmapFile, "heatmap-input");
+            const response = await fetch(heatmapToggle.dataset.url, {
+                method: "POST", body, signal: controller.signal, headers: {Accept: "application/json"},
+            });
+            if (!response.ok) throw new Error("Heatmap unavailable");
+            const images = await response.json();
+            if (heatmapRequest !== controller) return;
+            for (const [key, panel] of Object.entries(heatmapPanels)) panel.src = images[key];
+            heatmapReady = true;
+            heatmapStatus.textContent = "";
+        } catch {
+            if (heatmapRequest === controller) heatmapStatus.textContent = "Could not generate the heatmap. Try again.";
+            return;
+        } finally {
+            if (heatmapRequest === controller) {
+                heatmapRequest = null;
+                heatmapToggle.disabled = false;
+            }
+        }
+    }
+    heatmapComparison.hidden = false;
+    heatmapToggle.textContent = "Hide heatmap";
+    heatmapToggle.setAttribute("aria-pressed", "true");
+    heatmapComparison.scrollIntoView({block: "nearest", behavior: reducedMotion.matches ? "instant" : "smooth"});
+});
 
 function classifySelectedFile() {
     const file = fileInput.files[0];

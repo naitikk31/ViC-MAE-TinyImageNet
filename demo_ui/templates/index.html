@@ -71,6 +71,12 @@
                     </div>
                     <noscript><button type="submit" class="browse fallback-submit">Classify image</button></noscript>
                 </form>
+                {% if calibrated %}
+                <div class="heatmap-controls" id="heatmap-controls" hidden>
+                    <button class="text-button" id="heatmap-toggle" type="button" aria-pressed="false" aria-controls="heatmap-comparison" data-url="{{ url_for('heatmap') }}">Show heatmap</button>
+                    <span class="results-note" id="heatmap-status" role="status"></span>
+                </div>
+                {% endif %}
                 <div id="upload-error" class="notice error" role="alert"{% if not error %} hidden{% endif %}>
                     <span aria-hidden="true" class="notice-mark">!</span>
                     <div><strong>Couldn’t classify the image</strong><p id="error-text">{{ error or "" }}</p></div>
@@ -120,14 +126,34 @@
                         </li>
                         {% endfor %}
                     </ol>
-                    <div id="low-warning" class="notice warning" role="alert"{% if not low_confidence %} hidden{% endif %}>
+                    <div id="low-warning" class="notice warning" role="alert"{% if not (unsure if calibrated else low_confidence) %} hidden{% endif %}>
                         <span aria-hidden="true" class="notice-mark">!</span>
-                        <div><strong>Low confidence</strong><p>This image may fall outside the {{ num_classes }} classes.</p></div>
+                        <div><strong>Low-confidence warning</strong><p>This image may be outside the {{ num_classes }} trained classes, or the prediction may be unreliable.</p></div>
+                    </div>
+                    <div id="outside-classes-warning" class="notice warning" role="alert"{% if not outside_classes %} hidden{% endif %}>
+                        <span aria-hidden="true" class="notice-mark">!</span>
+                        <div><strong>Outside-classes flag</strong><p>This image is likely outside the {{ num_classes }} trained classes.</p></div>
                     </div>
                 </div>
-                <p class="results-note">Softmax scores are uncalibrated. The {{ threshold }}% warning threshold is only a rough guide.</p>
+                {% if calibrated %}<p class="results-note">Probabilities use temperature scaling. The low-confidence warning cutoff was fitted on Tiny-ImageNet.</p>
+                {% else %}<p class="results-note">Softmax scores are uncalibrated. The {{ threshold }}% warning threshold is only a rough guide.</p>{% endif %}
             </section>
         </div>
+
+        {% if calibrated %}
+        <section id="heatmap-comparison" class="panel heatmap-comparison" aria-labelledby="heatmap-title" hidden>
+            <h2 id="heatmap-title">Attribution heatmap</h2>
+            <div class="heatmap-grid">
+                <figure><img id="heatmap-original" alt="Image crop used for attribution"><figcaption>Original crop</figcaption></figure>
+                <figure><img id="heatmap-only" alt="Color map of positive patch attribution"><figcaption>Heatmap only</figcaption></figure>
+                <figure><img id="heatmap-overlay" alt="Attribution colors blended over the image crop"><figcaption>Overlay</figcaption></figure>
+            </div>
+            <div class="heatmap-legend" aria-label="Relative attribution from low to high">
+                <span>Low</span><span class="heatmap-gradient" aria-hidden="true"></span><span>High</span>
+            </div>
+            <p class="results-note">Colors show relative positive attribution for the top prediction on the center crop.</p>
+        </section>
+        {% endif %}
 
         <details id="class-list" class="class-panel">
             <summary><span><strong>Class list</strong><span class="class-summary">{{ num_classes }} Tiny-ImageNet categories</span></span><span class="chevron" aria-hidden="true"></span></summary>

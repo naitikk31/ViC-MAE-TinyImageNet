@@ -49,7 +49,7 @@ The model was finetuned with AdamW, layer-wise learning rate decay (0.75), Mixup
 
 A local Flask app that ranks the 200 Tiny-ImageNet classes for an uploaded image. It selects a local finetuning checkpoint by default, identifies the loaded file, and uses the validation preprocessing. If a matching evaluation record exists, the header shows its measured accuracy.
 
-The demo's softmax scores are uncalibrated, and its 30% low-confidence threshold is only a rough guide.
+With the matching `checkpoint-20.pth`, the demo uses six test-time views and temperature-scaled probabilities. The low-confidence warning uses calibrated maximum softmax probability, and the separate outside-classes flag uses raw energy from the mean logits. The **Show heatmap** control compares the center crop, Grad-CAM heatmap, and overlay side by side. Other checkpoints use uncalibrated scores unless matching reliability settings are supplied.
 
 - **Theme transition:** A wavy edge and silk strands travel down when switching to dark mode and up when switching to light mode. Reduced-motion mode switches instantly.
 - **Image upload:** Drag and drop, browse, or try a local validation example. The demo limits uploads to 8 MiB and 20 megapixels.
@@ -57,7 +57,7 @@ The demo's softmax scores are uncalibrated, and its 30% low-confidence threshold
 
 ### Running the Demo
 
-With the project Python environment active, run:
+With the demo's Python 3.11 or newer environment active, run:
 
 ```bash
 python demo.py
@@ -67,6 +67,14 @@ Then open [http://127.0.0.1:5000](http://127.0.0.1:5000) in your browser.
 From the project directory on Windows, the local interpreter is `.\.venv-vicmae-cached\env\Scripts\python.exe`.
 
 Use `python demo.py --checkpoint PATH` to select a checkpoint. Run `python eval_tiny_imagenet.py` to evaluate the default checkpoint on the validation split. The evaluator saves a new `validation.json` with the actual image count and metrics under `output/classification_eval/`.
+
+The demo requires the extracted Tiny-ImageNet dataset, the upstream `ViC-MAE/` checkout, and local classifier weights. To explicitly use the settings shipped for the measured checkpoint, run:
+
+```bash
+python demo.py --checkpoint output/20260918-044542-vit_base_patch16-224/checkpoint-20.pth --reliability-settings extension/demo_settings.json
+```
+
+The app verifies the checkpoint hash before applying those settings.
 
 ---
 
